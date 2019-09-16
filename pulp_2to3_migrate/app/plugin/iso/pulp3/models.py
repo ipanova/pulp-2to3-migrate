@@ -23,6 +23,8 @@ class Pulp2ISO(Pulp2to3Content):
 
     class Meta:
         unique_together = ('name', 'checksum', 'size', 'pulp2content')
+        default_related_name = 'iso_detail_model'
+
 
     @property
     def expected_digests(self):

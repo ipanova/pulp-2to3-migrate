@@ -18,17 +18,20 @@ SUPPORTED_PULP2_PLUGINS = {
     #     'Rpm',
     #     'Srpm',
     #     'YumRepoMetadataFile'],
-    # 'docker': [
-    #     'Blob',
-    #     'Image',
-    #     'Manifest',
-    #     'ManifestList',
-    #     'Tag'],
+    'docker': [
+        'Blob',
+        'Manifest',
+        'ManifestList',
+        'Tag'],
 }
 
 # 'pulp2_content_type_id': 'pulp_2to3_migrate pulp3 model class name '
 PULP_2TO3_CONTENT_MODEL_MAP = {
     'iso': 'Pulp2ISO',
+    'docker_blob': 'Pulp2Blob',
+    'docker_manifest': 'Pulp2Manifest',
+    'docker_manifest_list': 'Pulp2ManifestList',
+    'docker_tag': 'Pulp2Tag',
 }
 
 # For manfatory parameters which won't be used by migration tool, e.g. in Declarative Version
@@ -36,12 +39,12 @@ NOT_USED = 'Not Used'
 
 PULP_2TO3_PLUGIN_MAP = {
     'iso': 'pulp_file',
-    # 'docker' : 'pulp_container',
+    'docker' : 'pulp_docker',
     # 'rpm' : 'pulp_rpm',
 }
 
 PULP2_COLLECTION_MAP = {
     'iso': 'units_iso',
-    # 'docker': 'units_docker_manifest',
+    'docker': 'units_docker_manifest',
     # 'rpm': 'units_rpm',
 }

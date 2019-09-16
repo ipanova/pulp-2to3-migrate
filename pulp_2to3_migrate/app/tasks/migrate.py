@@ -42,7 +42,7 @@ def migrate_from_pulp2(migration_plan_pk, dry_run=False):
 
     # TODO: Migration Plan parsing and validation
     # For now, the list of plugins to migrate is hard-coded.
-    plugins_to_migrate = ['iso']
+    plugins_to_migrate = ['docker']
 
     # import all pulp 2 content models
     # (for each content type: one works with mongo and other - with postgresql)
@@ -79,6 +79,8 @@ async def migrate_content(content_models):
     Args:
          content_models: List of Pulp 2 content models to migrate data for
     """
+    import pydevd
+    pydevd.settrace('localhost', port=12345, stdoutToServer=True, stderrToServer=True)
     pre_migrators = []
     content_migrators = []
     for content_model in content_models:
@@ -99,8 +101,9 @@ async def migrate_content(content_models):
             pb.total += pulp2content_qs.count()
         pb.save()
 
+        #pending = [asyncio.gather(content) for content in content_migrators]
+        #await asyncio.wait(pending)
         await asyncio.wait(content_migrators)
-
         pb.done = pb.total
 
 
@@ -141,11 +144,10 @@ async def pre_migrate_content(content_model):
     pulp2detail_pb.save()
 
     existing_count = 0
-    for i, record in enumerate(mongo_content_qs.only('id',
-                                                     '_storage_path',
-                                                     '_last_updated',
-                                                     '_content_type_id',
-                                                     'downloaded').batch_size(batch_size)):
+    fields = set(['id','_storage_path','_last_updated','_content_type_id'])
+    if hasattr(content_model.pulp2, 'downloaded'):
+        fields.add('downloaded')
+    for i, record in enumerate(mongo_content_qs.only(*fields).batch_size(batch_size)):
         if record['_last_updated'] == last_updated:
             # corner case - content with the last``last_updated`` date might be pre-migrated;
             # check if this content is already pre-migrated
@@ -161,12 +163,12 @@ async def pre_migrate_content(content_model):
                 pulp2detail_pb.total -= 1
                 pulp2detail_pb.save()
                 continue
-
         item = Pulp2Content(pulp2_id=record['id'],
                             pulp2_content_type_id=record['_content_type_id'],
                             pulp2_last_updated=record['_last_updated'],
                             pulp2_storage_path=record['_storage_path'],
-                            downloaded=record['downloaded'])
+                            downloaded=record['downloaded'] if hasattr(record, 'downloaded') else True)
+
         _logger.debug('Add content item to the list to migrate: {item}'.format(item=item))
         pulp2content.append(item)
 

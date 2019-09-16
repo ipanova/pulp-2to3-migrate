@@ -20,10 +20,15 @@ class Pulp2Content(Model):
     Relations:
         pulp3_content (models.ForeignKey): Pulp 3 content which Pulp 2 content was migrated to
     """
+
+    @property
+    def detail_model(self):
+        return getattr(self, '%s_detail_model' % self.pulp2_content_type_id).get()
+
     pulp2_id = models.CharField(max_length=255)
     pulp2_content_type_id = models.CharField(max_length=255)
     pulp2_last_updated = models.PositiveIntegerField()
-    pulp2_storage_path = models.TextField()
+    pulp2_storage_path = models.TextField(null=True) # what about content without storage_path
     downloaded = models.BooleanField(default=True)
     pulp3_content = models.ForeignKey(Content, on_delete=models.SET_NULL, null=True)
 
@@ -36,7 +41,6 @@ class Pulp2to3Content(Model):
     Pulp 2to3 detail content model to store pulp 2 content details for Pulp 3 content creation.
     """
     pulp2content = models.ForeignKey(Pulp2Content,
-                                     related_name='detail_model',
                                      on_delete=models.CASCADE)
     type = '<your pulp 2 content type>'
 
