@@ -45,6 +45,7 @@ from .repository import (
     RpmDistributor,
     RpmImporter,
 )
+
 from pulpcore.plugin.stages import (
     ArtifactSaver,
     ContentSaver,
@@ -60,8 +61,11 @@ from pulpcore.plugin.stages import (
 from . import package_utils
 from pulp_2to3_migration.app.constants import NOT_USED
 from pulp_2to3_migration.app.models import (
+    Pulp2Content,
     Pulp2Importer,
     Pulp2LazyCatalog,
+    Pulp2RepoContent,
+    Pulp2Repository,
 )
 
 
@@ -124,6 +128,14 @@ class RpmMigrator(Pulp2to3PluginMigrator):
     }
     future_types = {
         'rpm': Pulp2Rpm,
+        'package_group': Pulp2PackageGroup,
+        'package_category': Pulp2PackageCategory,
+    }
+    artifactless_types= {
+        'package_langpacks': Pulp2PackageLangpacks,
+        'package_group': Pulp2PackageGroup,
+        'package_category': Pulp2PackageCategory,
+        'package_environment': Pulp2PackageEnvironment,
     }
 
     @classmethod
@@ -131,7 +143,7 @@ class RpmMigrator(Pulp2to3PluginMigrator):
         """
         Migrate pre-migrated Pulp 2 RPM plugin content.
         """
-        first_stage = RpmContentMigrationFirstStage(cls)
+        first_stage = ContentMigrationFirstStage(cls)
         dm = RpmDeclarativeContentMigration(first_stage=first_stage)
         await dm.create()
 
@@ -166,108 +178,6 @@ class RpmDeclarativeContentMigration(DeclarativeContentMigration):
         return pipeline
 
 
-class RpmContentMigrationFirstStage(ContentMigrationFirstStage):
-    """
-    The first stage of a Rpm content migration pipeline.
-    """
-
-    async def migrate_to_pulp3(self, batch, pb=None):
-        """
-        A default implementation of DeclarativeContent creation for migrating content to Pulp 3.
-
-        Plugin writers might want to override this method if it doesn't satisfy their needs as is.
-
-        In this implementation there is an assumption that each content has one artifact.
-
-        Args:
-            batch: A batch of Pulp2Content objects to migrate to Pulp 3
-        """
-        @functools.lru_cache(maxsize=20)
-        def get_remote_by_importer_id(importer_id):
-            """
-            Args:
-                importer_id(str): Id of an importer in Pulp 2
-
-            Returns:
-                remote(pulpcore.app.models.Remote): A corresponding remote in Pulp 3
-
-            """
-            try:
-                pulp2importer = Pulp2Importer.objects.get(pulp2_object_id=importer_id)
-            except ObjectDoesNotExist:
-                return
-            return pulp2importer.pulp3_remote
-
-        for pulp_2to3_detail_content in batch:
-            pulp2content = pulp_2to3_detail_content.pulp2content
-
-            if getattr(pulp2content, 'downloaded'):
-
-                # get all Lazy Catalog Entries (LCEs) for this content
-                pulp2lazycatalog = Pulp2LazyCatalog.objects.filter(
-                    pulp2_unit_id=pulp2content.pulp2_id)
-
-                if not pulp2content.downloaded and not pulp2lazycatalog:
-                    _logger.warn(_('On_demand content cannot be migrated without an entry in the '
-                                   'lazy catalog, pulp2 unit_id: '
-                                   '{}'.format(pulp2content.pulp2_id)))
-                    continue
-
-            pulp3content = await pulp_2to3_detail_content.create_pulp3_content()
-            future_relations = {'pulp2content': pulp2content}
-
-            comps_types = ('package_langpacks', 'package_group', 'package_category',
-                           'package_environment')
-            if pulp_2to3_detail_content.pulp2_type in comps_types:
-                # dc without artifact
-                dc = DeclarativeContent(content=pulp3content)
-                dc.extra_data = future_relations
-                await self.put(dc)
-            else:
-
-                artifact = await self.create_artifact(pulp2content.pulp2_storage_path,
-                                                      pulp_2to3_detail_content.expected_digests,
-                                                      pulp_2to3_detail_content.expected_size,
-                                                      downloaded=pulp2content.downloaded)
-
-                # Downloaded content with no LCE
-                if pulp2content.downloaded and not pulp2lazycatalog:
-                    da = DeclarativeArtifact(
-                        artifact=artifact,
-                        url=NOT_USED,
-                        relative_path=pulp_2to3_detail_content.relative_path_for_content_artifact,
-                        remote=None,
-                        deferred_download=False)
-                    dc = DeclarativeContent(content=pulp3content, d_artifacts=[da])
-                    dc.extra_data = future_relations
-                    await self.put(dc)
-
-                # Downloaded or on_demand content with LCEs.
-                #
-                # To create multiple remote artifacts, create multiple instances of declarative
-                # content which will differ by url/remote in their declarative artifacts
-                for lce in pulp2lazycatalog:
-                    remote = get_remote_by_importer_id(lce.pulp2_importer_id)
-                    deferred_download = not pulp2content.downloaded
-                    if not remote and deferred_download:
-                        _logger.warn(_('On_demand content cannot be migrated without a remote '
-                                       'pulp2 unit_id: {}'.format(pulp2content.pulp2_id)))
-                        continue
-
-                    da = DeclarativeArtifact(
-                        artifact=artifact,
-                        url=lce.pulp2_url,
-                        relative_path=pulp_2to3_detail_content.relative_path_for_content_artifact,
-                        remote=remote,
-                        deferred_download=deferred_download)
-                    dc = DeclarativeContent(content=pulp3content, d_artifacts=[da])
-                    dc.extra_data = future_relations
-                    await self.put(dc)
-
-            if pb:
-                pb.increment()
-
-
 class InterrelateContent(Stage):
     """
     Stage for relating Content to other Content.
@@ -277,21 +187,42 @@ class InterrelateContent(Stage):
         """
         Relate each item in the input queue to objects specified on the DeclarativeContent.
         """
-        async for batch in self.batches():
-            modulemd_packages_batch = []
+
+        async for dc in self.items():
+            import pydevd
+            pydevd.settrace('localhost', port=12345, stdoutToServer=True, stderrToServer=True)
             with transaction.atomic():
-                for dc in batch:
-                    if type(dc.content) == pulp3_models.Modulemd:
-                        thru = self.relate_packages_to_module(dc)
-                        modulemd_packages_batch.extend(thru)
+                if type(dc.content) == pulp3_models.Modulemd:
+                    thru = self.relate_packages_to_module(dc)
+                    ModulemdPackages = pulp3_models.Modulemd.packages.through
+                    ModulemdPackages.objects.bulk_create(objs=thru,
+                                                         ignore_conflicts=True,
+                                                         batch_size=1000)
+                elif type(dc.content) == pulp3_models.PackageGroup:
+                    thru = self.relate_packages_to_group(dc)
+                    PackageGroupPackages = pulp3_models.PackageGroup.related_packages.through
+                    PackageGroupPackages.objects.bulk_create(objs=thru,
+                                                             ignore_conflicts=True,
+                                                             batch_size=1000)
+                elif type(dc.content) == pulp3_models.PackageCategory:
+                    thru = self.relate_groups_to_category(dc)
+                    PackageCategoryGroups = pulp3_models.PackageCategory.packagegroups.through
+                    PackageCategoryGroups.objects.bulk_create(objs=thru,
+                                                              ignore_conflicts=True,
+                                                             batch_size=1000)
+                elif type(dc.content) == pulp3_models.PackageEnvironment:
+                    groups_thru, options_thru = self.relate_groups_to_environment(dc)
+                    PackageEnvironmentGroups = pulp3_models.PackageEnvironment.packagegroups.through
+                    PackageEnvironmentGroups.objects.bulk_create(objs=groups_thru,,
+                                                                 ignore_conflicts=True,
+                                                                 batch_size=1000)
+                    PackageEnvOptGroups = pulp3_models.PackageEnvironment.optionalgroups.through
+                    PackageEnvOptGroups.objects.bulk_create(objs=options_thru,
+                                                            ignore_conflicts=True,
+                                                            batch_size=1000)
 
-                ModulemdPackages = pulp3_models.Modulemd.packages.through
-                ModulemdPackages.objects.bulk_create(objs=modulemd_packages_batch,
-                                                     ignore_conflicts=True,
-                                                     batch_size=1000)
+            await self.put(dc)
 
-            for dc in batch:
-                await self.put(dc)
 
     def relate_packages_to_module(self, module_dc):
         """
@@ -328,3 +259,102 @@ class InterrelateContent(Stage):
                 thru.append(ModulemdPackages(package_id=pkg.pk, modulemd_id=module_dc.content.pk))
                 already_related.append(pkg.nevra)
         return thru
+
+    def relate_packages_to_group(self, group_dc):
+        """
+        Relate Packages to a Group.
+
+        Args:
+            module_dc (pulpcore.plugin.stages.DeclarativeContent): dc for a PackageGroup
+        """
+        PackageGroupPackages = pulp3_models.PackageGroup.related_packages.through
+        packages = group_dc.content.packages
+        package_list = []
+        for pkg in packages:
+            package_list.append(pkg['name'])
+        pulp2_repo_id = group_dc.extra_data.get('pulp2_repo_id')
+        pulp2_repo = Pulp2Repository.objects.get(pulp2_repo_id=pulp2_repo_id)
+        # all pulp2 unit_ids for rpm within the pulp2repo
+        unit_ids = Pulp2RepoContent.objects.filter(
+            pulp2_repository=pulp2_repo,
+            pulp2_content_type_id='rpm').values_list('pulp2_unit_id', flat=True)
+        # all pulp3 rpm pks within the pulp2repo
+        pulp3_content = set(Pulp2Content.objects.filter(pulp2_id__in=unit_ids).only(
+            'pulp3_content').values_list('pulp3_content__pk', flat=True))
+        pulp3_packages = pulp3_models.Package.objects.filter(
+            name__in=package_list,
+            pk__in=pulp3_content).only('pk').values_list('pk', flat=True)
+        thru = []
+        for pkg in pulp3_packages:
+            thru.append(PackageGroupPackages(package_id=pkg, packagegroup_id=group_dc.content.pk))
+        return thru
+
+    def relate_groups_to_category(self, category_dc):
+        """
+        Relate groups to a Category
+
+        Args:
+            module_dc (pulpcore.plugin.stages.DeclarativeContent): dc for a PackageCategory
+        """
+        PackageCategoryGroups = pulp3_models.PackageCategory.packagegroups.through
+        groups = category_dc.content.group_ids
+        group_list = []
+        for grp in groups:
+            group_list.append(grp['name'])
+        pulp2_repo_id = category_dc.extra_data.get('pulp2_repo_id')
+        pulp2_repo = Pulp2Repository.objects.get(pulp2_repo_id=pulp2_repo_id)
+        # all pulp2 unit_ids for groups within the pulp2repo
+        unit_ids = Pulp2RepoContent.objects.filter(
+            pulp2_repository=pulp2_repo,
+            pulp2_content_type_id='package_group').values_list('pulp2_unit_id', flat=True)
+        # all pulp3 groups pks within the pulp2repo
+        pulp3_content = set(Pulp2Content.objects.filter(pulp2_id__in=unit_ids).only(
+            'pulp3_content').values_list('pulp3_content__pk', flat=True))
+        pulp3_groups = pulp3_models.PackageGroup.objects.filter(
+            id__in=group_list,
+            pk__in=pulp3_content).only('pk').values_list('pk', flat=True)
+        thru = []
+        for grp in pulp3_groups:
+            thru.append(PackageCategoryGroups(packagegroup_id=grp,
+                                              packagecategory_id=category_dc.content.pk))
+        return thru
+
+    def relate_groups_to_environment(self, env_dc):
+        """
+        Relate groups to a Environment
+
+        Args:
+            module_dc (pulpcore.plugin.stages.DeclarativeContent): dc for a PackageCategory
+        """
+        PackageEnvGroups = pulp3_models.PackageEnvironment.packagegroups.through
+        PackageEnvOptGroups = pulp3_models.PackageEnvironment.optionalgroups.through
+        groups = env_dc.content.group_ids
+        options = env_dc.content.option_ids
+        group_list = []
+        option_list = []
+        for grp in groups:
+            group_list.append(grp['name'])
+        for opt in options:
+            option_list.append(opt['name'])
+        pulp2_repo_id = env_dc.extra_data.get('pulp2_repo_id')
+        pulp2_repo = Pulp2Repository.objects.get(pulp2_repo_id=pulp2_repo_id)
+        # all pulp2 unit_ids for groups within the pulp2repo
+        unit_ids = Pulp2RepoContent.objects.filter(
+            pulp2_repository=pulp2_repo,
+            pulp2_content_type_id='package_group').values_list('pulp2_unit_id', flat=True)
+        # all pulp3 groups pks within the pulp2repo
+        pulp3_content = set(Pulp2Content.objects.filter(pulp2_id__in=unit_ids).only(
+            'pulp3_content').values_list('pulp3_content__pk', flat=True))
+        pulp3_groups = pulp3_models.PackageGroup.objects.filter(
+            id__in=group_list + option_list,
+            pk__in=pulp3_content).only('pk', 'id')
+        group_thru = []
+        option_thru = []
+        for grp in pulp3_groups:
+            if grp.id in group_list:
+                group_thru.append(PackageEnvGroups(packagegroup_id=grp.pk,
+                                                   packageenvironment_id=env_dc.content.pk))
+            elif grp.id in option_list:
+                option_thru.append(PackageEnvOptGroups(packagegroup_id=grp.pk,
+                                                       packageenvironment_id=env_dc.content.pk))
+        return group_thru, option_thru
